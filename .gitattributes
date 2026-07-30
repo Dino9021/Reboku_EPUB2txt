@@ -1,0 +1,11 @@
+# The sample pair is a reproducibility check — converting samples/Sample.epub must
+# reproduce samples/Sample.txt exactly. The converter writes the platform's own line
+# endings (CRLF on Windows, LF elsewhere), so the checked-out sample has to do the
+# same whatever the cloner's core.autocrlf happens to be.
+samples/Sample.txt text eol=native
+
+# A zip; never touch it.
+*.epub binary
+
+# Batch files only run reliably with CRLF.
+*.bat text eol=crlf

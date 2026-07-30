@@ -1,0 +1,8 @@
+# EPUB2txt runs on the Python standard library alone. This one package is
+# OPTIONAL: it is only used to turn a book's cover into the embedded thumbnail.
+# Without it every book still converts, the header just says "Cover: False".
+Pillow>=9.0
+
+# To build the standalone Windows .exe you also need:
+#     pip install pyinstaller
+# (build-exe.bat installs it for you.)

@@ -1,0 +1,14 @@
+# PyInstaller output — rebuild with build-exe.bat
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Brand artwork. build-exe.bat uses it when it is here and falls back to
+# PyInstaller's default icon when it is not, so the build works without it.
+icon.ico
