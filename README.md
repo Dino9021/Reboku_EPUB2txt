@@ -93,14 +93,30 @@ come out roughly twice the size.
   the book drew a box round it, those blank lines become a row of twenty `=` (with a blank line
   outside each). Three yes-or-no signals decide it, and a heading the chapter marker already
   repeats is not printed twice.
-- **原書的註解會標出來** —— 內文裡寫成 `(註[2])`、註解本身寫成 `註[2]: 內容`，以前參照只剩一個
+- **原書的註解會標出來** —— 內文裡寫成 `(註[2])`（**前後各留一個半形空格**，已經有的不重複加；後面緊接標點時那一側不留，標點照中文習慣貼著字）、註解本身寫成 `註[2]: 內容`，以前參照只剩一個
   孤零零的數字。判定完全照 **EPUB 3 標準自己的詞彙**（`epub:type="footnote"`、`noteref`、
   `role="doc-backlink"`），沒有宣告的參照就看「它指向的是不是一個註解」；號碼取書自己印的那個字，
   不重新編號。
-  **Footnotes are marked out** — `(註[2])` in the text, `註[2]: …` for the note itself, where a
+  **Footnotes are marked out** — `(註[2])` in the text (with **one space on each side**, added only where there is not one already, and none before punctuation, which CJK typesetting keeps tight against the word), `註[2]: …` for the note itself, where a
   bare number used to sit looking like a stray character. Recognition is entirely by the
   **EPUB 3 / DPUB-ARIA vocabulary**; a reference that declares nothing is recognised by pointing
   at a note, and the number is the one the book printed.
+- **連一個標準標記都沒寫的書也認得出來** —— 有些書的註解只有一個 class，但**參照與註解互相指著
+  對方的 id**，那是結構不是樣貌。一道關卡讓它不會誤認：參照那一邊**必須在一行的中間**（目次條目
+  與「回到目次」也互指，但目次條目占滿整行）。
+  **Books that declare nothing at all** are still handled: the reference and the note **point at
+  each other's id**, which is structure rather than appearance. One gate keeps it honest — the
+  reference must sit *inside* a line, because a contents entry and its 「back」 link are mutual
+  too and a contents entry IS its whole line. Which end is the reference follows reading order.
+- **原書沒有編號的註解會自己拿到一個 `★` 號** —— 有的書把註解掛在**詞**上（例如某個名詞指向一段
+  解釋），那些字是讀者的內文、**不可以被記號吃掉**：所以保留原字、後面加上 `(註[★1])`，註解那邊
+  寫 `註[★1]: …`。「是編號還是詞」用一份**固定的字元清單**判斷（半形/全形數字、`①`、`*1`、`✽`、
+  `†` 這些），不看長度、不看上標；同一條註解被兩個不同的詞指到時，兩邊共用同一個 `★` 號。
+  **A note the book never numbered gets one**, written `註[★1]`: some books hang the note on a
+  **word**, and those words are text the reader is meant to see, so the marker is added after
+  them instead of replacing them. Number-or-word is decided by a **closed character set** (half-
+  and full-width digits, `①`, `*1`, `✽`, `†`…), never by length or superscript. Two different
+  words pointing at one note share one `★` number, so both can be found.
 - **目次項目不會因為那一頁是圖而消失** —— 掃描頁、圖版沒有可抽取的文字，它的目次項目會**往後**
   落在下一個有文字的頁面上（幾個標籤落在同一頁是正常的），而不是連標題一起丟掉。
   **A TOC entry never disappears because its page is a picture** — an entry pointing at a plate

@@ -387,9 +387,11 @@ class _Css:
         + ["border", "border-style", "border-width"]
     )
 
-    # Read for the styled-inline-run questions only ([heavier], [run_framed]), and out of a
-    # WIDER set of selectors — see `_run` below.
-    RUN = ("font-size", "font-weight") + BOX
+    # Read for the styled-run / block-appearance questions only ([heavier], [run_framed],
+    # [run_size], [run_underlined], [run_centred], [run_indented]), and out of a WIDER set of
+    # selectors — see `_run` below.
+    RUN = ("font-size", "font-weight", "text-indent", "text-align",
+           "text-decoration", "text-decoration-line") + BOX
 
     def __init__(self) -> None:
         # (tag, class) -> {property: value}; later rules win, class beats bare tag.
@@ -487,6 +489,34 @@ class _Css:
     def border(self, tag: str, classes: list[str], side: str) -> bool:
         """Does this element draw a visible border on one side? See [_border_visible]."""
         return _border_visible(lambda prop: self.declared(tag, classes, prop), side)
+
+    def run_size(self, classes: list[str]) -> float | None:
+        """The font-size these classes declare, in em, or None when they declare none."""
+        for cls in reversed(classes):
+            value = self._run.get(cls, {}).get("font-size", "").strip().lower()
+            if not value:
+                continue
+            if value.endswith("%"):
+                try:
+                    return float(value[:-1]) / 100
+                except ValueError:
+                    return None
+            length = _css_length(value)
+            return None if length is None else length / _EM_PX
+        return None
+
+    def run_has(self, classes: list[str], prop: str, wanted: str) -> bool:
+        """Does any of these classes declare `prop` with `wanted` in its value?"""
+        return any(wanted in self._run.get(cls, {}).get(prop, "").strip().lower()
+                   for cls in classes)
+
+    def run_indented(self, classes: list[str]) -> bool:
+        """Does the stylesheet give this block a first-line indent of its own?"""
+        for cls in classes:
+            value = self._run.get(cls, {}).get("text-indent", "").strip()
+            if value and _css_length(value) not in (None, 0):
+                return True
+        return False
 
     def run_framed(self, classes: list[str]) -> bool:
         """Is there a line on any side of this styled inline run?
@@ -652,6 +682,34 @@ def _extra_blanks(
 # have no reference in the text at all and are left alone.
 _NOTE_TYPES = ("footnote", "endnote", "rearnote")
 _NOTE_ROLES = ("doc-footnote", "doc-endnote", "doc-note")
+# The PLURAL words mark the notes AREA — a collection of notes, not one note. Books that mark
+# the area but not the individual notes are common (`<section epub:type="endnotes"><ol><li
+# id="footnote-007">`), so the area is what says "everything in here is a note".
+_NOTE_AREAS = ("footnotes", "endnotes", "rearnotes")
+_NOTE_AREA_ROLES = ("doc-footnotes", "doc-endnotes", "doc-rearnotes")
+
+
+def _is_note_area(values: dict[str, str]) -> bool:
+    """Is this element the container a book keeps its notes in?"""
+    tokens = set()
+    for attr in ("epub:type", "role"):
+        tokens.update((values.get(attr) or "").lower().split())
+    return bool(tokens.intersection(_NOTE_AREAS) or tokens.intersection(_NOTE_AREA_ROLES))
+
+
+def _is_note_element(values: dict[str, str]) -> bool:
+    """Is this element ONE note (not the container the notes sit in)?
+
+    ⚠️ The vocabulary words are matched as WHOLE TOKENS, never as substrings. The plural
+    `epub:type="endnotes"` / `role="doc-endnotes"` is the notes AREA, and `"endnote" in
+    "endnotes"` is true — so a substring test opened a note on the container, left it open
+    across every note inside it, and every one of them took the FIRST note's number. Caught on
+    a book whose two notes both came out as 「註[1]」 (owner 2026-07-30).
+    """
+    tokens = set()
+    for attr in ("epub:type", "role", "rel"):
+        tokens.update((values.get(attr) or "").lower().split())
+    return bool(tokens.intersection(_NOTE_TYPES) or tokens.intersection(_NOTE_ROLES))
 
 
 def _note_word(language: str) -> str:
@@ -679,6 +737,103 @@ _NOTE_PREFIXES = ("註", "注", "주", "Note", "note")
 # replaces that marker, the separator goes with it — see the note branch in [_BlockText._flush].
 NOTE_SEPARATORS = "：:、．.，,)）]】"
 
+# A marker this program wrote into a sentence, with whatever space happens to sit around it.
+# Used to give every one of them ONE space on each side — see [_space_note_marks].
+_MARK_IN_TEXT = re.compile(r"[ 　]*(\((?:註|注|주|Note)\[[^\]\n]{1,16}\]\))[ 　]*")
+
+
+# Punctuation that CLOSES what came before it, so it sits tight against it and takes no space
+# in front (owner 2026-07-31). A closed set, like every other character list in this file — not
+# 「looks like punctuation」, not 「is full-width」.
+_TIGHT_AFTER = frozenset("。，、；：？！…—．" "」』）】〉》〕｝" ",.;:?!)]}")
+
+
+def _space_note_marks(text: str) -> str:
+    """One space each side of a note marker — never two, and none where one would look wrong.
+
+    ⚠️ Run on the FINISHED line, not where the marker is written: what follows it decides
+    whether a space belongs there, and that text does not exist yet when the reference's `</a>`
+    closes. Doing it here also means the two ways a marker is written — replacing the book's own
+    number, or appended after the words it explains — end up spaced identically.
+
+    The space AFTER is dropped when the next character closes the sentence or the clause
+    (`_TIGHT_AFTER`): CJK typography sets 「。」「，」「」」 hard against the word before them, and a
+    space there reads as a hole in the sentence. Measured before deciding — **2,355 of the
+    library's 5,403 markers** are followed by one of these, so it is the common case rather than
+    an edge case. The space BEFORE is always kept: that is the side separating the marker from
+    the words it belongs to.
+
+    ⚠️ Only ever called for a line this program actually put a marker on (see `_wrote_mark`).
+    A book is free to print 「(註[2])」 as its own text, and that text is the author's to space.
+    """
+    def spaced(m: "re.Match[str]") -> str:
+        after = text[m.end():m.end() + 1]
+        return f" {m.group(1)}" + ("" if after and after in _TIGHT_AFTER else " ")
+
+    return _MARK_IN_TEXT.sub(spaced, text).strip()
+
+# Brackets a book may already have put round its own marker. The label written here supplies
+# its own, so a marker printed 「[1]」 would otherwise come out 「註[[1]]」 — 403 of those across
+# the sample library (owner 2026-07-30). Stripped ONLY when the pair wraps the whole marker.
+NOTE_BRACKETS = (("[", "]"), ("［", "］"), ("(", ")"), ("（", "）"), ("〔", "〕"), ("【", "】"),
+                 ("〈", "〉"), ("<", ">"))
+
+# What a note's marker is allowed to be made of (owner 2026-07-30): digits in any of the
+# notations books use, plus the classic footnote symbols. A real note is NUMBERED — that is
+# what tells it apart from a link on a WORD, which points at an explanation rather than
+# carrying a note of its own.
+#
+# ⚠️ A closed set of characters, not a length or a look. CJK numerals are deliberately NOT
+# here: 「十」 is a number and also a word, and there is no way to tell which one a book meant.
+# Every character listed is either a digit or a mark that has no meaning as a word \u2014 which is
+# why the full-width digits and the asterisk family belong (a book in the test library marks its
+# dedication line with `\u273d` and hangs a note on it) while \u300c\u5341\u300d still does not.
+_MARKER_CHARS = frozenset(
+    "0123456789*.-\u2013\u2014#\u2020\u2021\u00a7\u00b6"
+    "\uff10\uff11\uff12\uff13\uff14\uff15\uff16\uff17\uff18\uff19"  # full-width \uff10-\uff19
+    "\uff0a\u203b\u273d\u2731\u2217\ufe61"  # \uff0a \u203b \u273d \u2731 \u2217 \ufe61
+    "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079"
+    "\u2460\u2461\u2462\u2463\u2464\u2465\u2466\u2467\u2468\u2469"
+    "\u246a\u246b\u246c\u246d\u246e\u246f\u2470\u2471\u2472\u2473"
+    "\u2474\u2475\u2476\u2477\u2478\u2479\u247a\u247b\u247c\u247d"
+)
+
+
+def _marker_core(shown: str) -> str:
+    """What a reference shows, with the book's own word and brackets taken off.
+
+    Both come off, in whichever order the book put them: 「（註1）」 is one real book's way of
+    writing the marker 1, and taking only the brackets off left 「註1」 — which then read as
+    words rather than a number, and came out as 註[註1] (29 notes in one book).
+    """
+    text = shown.strip()
+    while True:
+        before = text
+        for prefix in _NOTE_PREFIXES:
+            if text.startswith(prefix) and text[len(prefix):].strip():
+                text = text[len(prefix):].strip()
+                break
+        for opening, closing in NOTE_BRACKETS:
+            if text.startswith(opening) and text.endswith(closing) and len(text) > 2:
+                text = text[1:-1].strip() or text
+                break
+        if text == before:
+            return text
+
+
+def _is_marker(shown: str) -> bool:
+    """Is this the NUMBER of a note, rather than a word that links to an explanation?
+
+    ⚠️ INTENTIONAL — **DO NOT answer this with a length, a superscript, or 「it looks like a
+    number」.** The test is membership of [_MARKER_CHARS], a closed set: every character of what
+    the reference shows has to be in it. Guessing from appearance is how this kind of code goes
+    wrong, and here it would decide whether the reader's own words survive: one book's references
+    read as a two-word phrase followed by a digit — it ends in a number and is still words. A
+    reference that fails this test is not rejected; it takes the ★ road instead.
+    """
+    core = _marker_core(shown)
+    return bool(core) and all(ch in _MARKER_CHARS for ch in core)
+
 
 def _note_label(word: str, shown: str) -> str:
     """`註[2]` — and never `註[註1]` (owner 2026-07-30).
@@ -686,14 +841,9 @@ def _note_label(word: str, shown: str) -> str:
     Some books print the word in the reference itself, marking a footnote 「註1」, so wrapping
     that verbatim would give 註[註1]. The prefix comes off by **exact string
     comparison** against the words [_note_word] can produce — no pattern, no "looks like a
-    note marker" test — and only when something is left after it.
+    note marker" test — and only when something is left after it (see [_marker_core]).
     """
-    text = shown.strip()
-    for prefix in _NOTE_PREFIXES:
-        if text.startswith(prefix) and text[len(prefix):].strip():
-            text = text[len(prefix):].strip()
-            break
-    return f"{word}[{text}]"
+    return f"{word}[{_marker_core(shown)}]"
 
 
 def _anchor_key(doc: str, href: str) -> str:
@@ -720,27 +870,54 @@ class _NoteScan(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.doc = doc
         self.note_ids: set[str] = set()
-        # (target key, the text it shows, did it declare itself a noteref)
-        self.links: list[tuple[str, str, bool]] = []
+        # One entry per internal <a>, in document order:
+        #   (target key, the text it shows, declared itself a noteref,
+        #    the ids ON or INSIDE it, the index of the line it sits on)
+        # The ids are what makes a MUTUAL pair visible: a note's way home points at the id
+        # the reference carries, and books put that id on a <span> inside the link as often
+        # as on the link itself. The line index answers "is this link the whole line?" — a
+        # contents entry is, and a contents list linking to a chapter that links back is
+        # mutual too, so that gate is what keeps a table of contents out of this.
+        self.links: list[tuple[str, str, bool, list[str], int]] = []
+        self.lines: list[str] = []
+        # The ids inside ONE note element, one list per note. A book can point two references at
+        # one note: its first line names two related words and carries an id on each, so both
+        # references mean the same note — which is what lets them share a ★ number
+        # (see [_note_index]).
+        self.note_groups: list[list[str]] = []
         self._note_depth: list[int] = []  # len(_open) at which a note element opened
         self._open: list[str] = []
-        self._link: tuple[str, bool] | None = None
+        self._block_ids: list[str] = []  # the id of each open block element, or ""
+        self._group_depth: list[int] = []  # len(_open) at which each note ELEMENT opened
+        self._group_at: list[int] = []  # where in note_groups each of those is kept
+        self._link: list | None = None  # [target, declared, ids, buffer position]
         self._buf: list[str] = []
 
     def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[no-untyped-def]
         values = dict(attrs)
         marks = " ".join((values.get("epub:type", ""), values.get("role", ""),
                           values.get("rel", ""))).lower()
+        if tag in _BlockText.BLOCK or tag == "br":
+            self._flush()
         if tag in _BlockText.BLOCK and tag != "hr":
             self._open.append(tag)
-            if any(t in marks for t in _NOTE_TYPES) or any(r in marks for r in _NOTE_ROLES):
+            self._block_ids.append(values.get("id") or "")
+            if _is_note_element(values):
+                self._group_depth.append(len(self._open))
+                self._group_at.append(len(self.note_groups))
+                self.note_groups.append([])
+            if _is_note_element(values) or _is_note_area(values):
                 self._note_depth.append(len(self._open))
         if self._note_depth and values.get("id"):
             self.note_ids.add(f"{self.doc}#{values['id']}")
+            if self._group_at:
+                self.note_groups[self._group_at[-1]].append(f"{self.doc}#{values['id']}")
         href = (values.get("href") or "").strip()
         if tag == "a" and href and not EXTERNAL_LINK.match(href):
-            self._link = (_anchor_key(self.doc, href), "noteref" in marks or "footnote" in marks)
-            self._buf = []
+            self._link = [_anchor_key(self.doc, href),
+                          "noteref" in marks or "footnote" in marks, [], len(self._buf)]
+        if self._link is not None and values.get("id"):
+            self._link[2].append(f"{self.doc}#{values['id']}")
 
     def handle_startendtag(self, tag: str, attrs) -> None:  # type: ignore[no-untyped-def]
         self.handle_starttag(tag, attrs)
@@ -749,30 +926,89 @@ class _NoteScan(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "a" and self._link:
-            key, declared = self._link
-            self.links.append((key, _collapse("".join(self._buf)), declared))
+            key, declared, ids, start = self._link
+            text = _collapse("".join(self._buf[start:]))
+            # The id that names a note is as often on the block holding the link back into the
+            # text as on the link itself: `<p id="the-note"><a href="#the-ref">1</a> …the note…`.
+            # Without the block's id that note has no visible way home and the pair is missed.
+            if self._block_ids and self._block_ids[-1]:
+                ids = ids + [f"{self.doc}#{self._block_ids[-1]}"]
+            self.links.append((key, text, declared, ids, len(self.lines)))
             self._link = None
         if tag in _BlockText.BLOCK and tag != "hr" and self._open:
+            self._flush()
             self._close_block()
 
     def _close_block(self) -> None:
         self._open.pop()
+        self._block_ids.pop()
         while self._note_depth and self._note_depth[-1] > len(self._open):
             self._note_depth.pop()
+        while self._group_depth and self._group_depth[-1] > len(self._open):
+            self._group_depth.pop()
+            self._group_at.pop()
 
     def handle_data(self, data: str) -> None:
-        if self._link is not None:
-            self._buf.append(data)
+        self._buf.append(data)
+
+    def _flush(self) -> None:
+        text = _collapse("".join(self._buf))
+        self._buf = []
+        if text:
+            self.lines.append(text)
 
 
-def _note_index(book: "Epub", docs: list[str]) -> tuple[set[str], dict[str, str]]:
-    """(anchor keys that belong to a note, anchor key -> the text its reference shows).
+def _note_index(
+    book: "Epub", docs: list[str],
+) -> tuple[set[str], dict[str, str], dict[str, int]]:
+    """(anchor keys that belong to a note, anchor key -> its reference's text,
+    anchor key -> its ★ number).
 
     Read BEFORE any of the book is written, so a note can be labelled with the number the
     text actually printed next to it even when the two are in different documents.
+
+    Two shapes of footnote are found here. The first declares itself, in EPUB 3 or
+    DPUB-ARIA vocabulary, and needs no guessing. The second declares nothing at all — and
+    is still structural, because a footnote and its reference POINT AT EACH OTHER: the
+    reference links to the note's id and the note links back to the reference's id. That
+    mutual pair is the entry test (owner 2026-07-30).
+
+    ⚠️ INTENTIONAL — **DO NOT drop the inline gate on the reference side.** A mutual pair is
+    only read as a footnote when the reference's text is PART of its line, never the whole of
+    it. A contents entry and the 「back to contents」 link at the end of a chapter point at each
+    other exactly the same way, and a contents entry IS its whole line — without this gate a
+    table of contents becomes a page of footnotes. This is a structural test, not a length one.
+
+    ⚠️ INTENTIONAL — **DO NOT decide which end of a mutual pair is the reference by anything
+    but reading order.** The earlier one is the reference. Both ends are inline links pointing
+    at each other, so without this every note counted its own way home as a second reference
+    and put a note's number on the line of prose it came from (measured: 2048 「references」 for
+    1024 pairs — exactly twice what the books hold). Reading order is the premise the whole
+    footnote pass already rests on: a note never comes before the text that cites it, 0
+    counter-examples across the sample library.
+
+    Then, however the note was found, WHAT ITS REFERENCE SHOWS decides how it is written. A
+    note is normally numbered, and the test is the marker character set — never a length, never
+    a look (see [_is_marker]):
+
+      * a marker (`1`, `[1]`, `①`, `*1`, `（註1）`) -> the marker is the note's name. It is
+        replaced where it stands: `(註[1])` in the text, `註[1]: …` at the note.
+      * WORDS -> a book can hang the note on a WORD (a term in the sentence links to a page
+        that explains it). Those words are the reader's text and have to stay, and the note has
+        no name of its own. So it is given one, added after the words rather than replacing
+        them: `<the words> (註[★1])` in the text, `註[★1]: …` at the note. 75 notes in 4 books,
+        measured.
+
+    ⚠️ INTENTIONAL — **DO NOT hand out ★ numbers per REFERENCE.** They are per NOTE, book-wide.
+    One note can be pointed at by two DIFFERENTLY WORDED references: a book's note line names two
+    related terms and carries an id on each, and the sentences link one term each. Both have to
+    say the same number, or the second says 註[★2] with nothing anywhere that answers to it. Two
+    ids inside one note element are one note, which is what [_NoteScan.note_groups] is for.
     """
     note_ids: set[str] = set()
-    links: list[tuple[str, str, bool]] = []
+    groups: list[list[str]] = []
+    # (target key, shown text, declared, the ids it owns, is it the whole line)
+    links: list[tuple[str, str, bool, list[str], bool]] = []
     for doc in docs:
         try:
             scan = _NoteScan(doc)
@@ -781,21 +1017,55 @@ def _note_index(book: "Epub", docs: list[str]) -> tuple[set[str], dict[str, str]
         except KeyError:
             continue
         note_ids |= scan.note_ids
-        links.extend(scan.links)
-    labels: dict[str, str] = {}
-    for key, text, declared in links:
+        groups.extend(scan.note_groups)
+        for key, text, declared, ids, line in scan.links:
+            whole = _norm(text) == _norm(scan.lines[line]) if line < len(scan.lines) else True
+            links.append((key, text, declared, ids, whole))
+    # Which link carries which id — a note's way home names the reference by its id.
+    owner: dict[str, int] = {}
+    for i, link in enumerate(links):
+        for key in link[3]:
+            owner.setdefault(key, i)
+    for i, (key, text, declared, ids, whole) in enumerate(links):
+        if declared or key in note_ids or not text or whole:
+            continue
+        home = owner.get(key)
+        if home is None or home <= i or links[home][0] not in ids:
+            continue
+        note_ids.add(key)  # a note that simply never said it was one
+    shown_at: dict[str, str] = {}  # in first-appearance order, which is what ★ numbers follow
+    for key, text, declared, _ids, _whole in links:
         if text and (declared or key in note_ids):
-            labels.setdefault(key, text)
-    return note_ids, labels
+            shown_at.setdefault(key, text)
+    group_of = {key: n for n, keys in enumerate(groups) for key in keys}
+    labels: dict[str, str] = {}
+    stars: dict[str, int] = {}
+    numbered: dict[int, int] = {}  # note element -> the ★ number its first reference got
+    count = 0
+    for key, text in shown_at.items():
+        if _is_marker(text):
+            labels[key] = text
+            continue
+        group = group_of.get(key)
+        if group is not None and group in numbered:
+            stars[key] = numbered[group]  # a second reference to a note already numbered
+            continue
+        count += 1
+        stars[key] = count
+        if group is not None:
+            numbered[group] = count
+    return note_ids, labels, stars
 
 
 class _Notes:
     """What ONE document needs to know to write this book's footnotes."""
 
-    def __init__(self, doc: str, note_ids: set[str], labels: dict[str, str], word: str) -> None:
+    def __init__(self, doc: str, note_ids: set[str], labels: dict[str, str], word: str,
+                 stars: dict[str, int] | None = None) -> None:
         self.doc = doc
         self._ids = note_ids
         self._labels = labels
+        self._stars = stars or {}
         self.word = word
 
     def reference(self, href: str, declared: bool) -> str:
@@ -809,10 +1079,83 @@ class _Notes:
         """The text the reference to this note showed, or ''."""
         return self._labels.get(f"{self.doc}#{element_id}", "")
 
+    def star(self, href: str) -> int:
+        """The ★ number of the note this link explains, or 0 — see [_note_index]."""
+        return self._stars.get(_anchor_key(self.doc, href), 0)
+
+    def star_for_id(self, element_id: str) -> int:
+        """The ★ number of the note that lives at this id, or 0."""
+        return self._stars.get(f"{self.doc}#{element_id}", 0)
+
+    def star_label(self, number: int) -> str:
+        return f"{self.word}[★{number}]"
+
+
+class _BodyStyle:
+    """What this book's ORDINARY paragraph looks like, measured from the book itself.
+
+    Every question in [_sub_headings]'s fourth signal and in the caption test is asked against
+    these two numbers, never against a fixed value — a book whose body text is 1.2em has no
+    "1.2em heading", and a book that indents nothing cannot say anything by not indenting.
+    """
+
+    def __init__(self, size: float = 1.0, indented: bool = False) -> None:
+        self.size = size
+        # ⚠️ Only true when MOST of the book's paragraphs carry a text-indent from the
+        # stylesheet. In a book that never declares one, "no indent" says nothing at all, so
+        # the signal that depends on it is switched off rather than guessed at.
+        self.indented = indented
+
+
+def _body_style(book: "Epub", docs: list[str]) -> _BodyStyle:
+    """Measure the book's ordinary paragraph: its font-size, and whether it is indented.
+
+    Read book-wide, before anything is written, for the same reason [_note_index] is: one
+    document can be all headings, and its own most-common size would then be a heading size.
+    """
+    sizes: dict[float, int] = {}
+    indented = total = 0
+    for doc in docs:
+        try:
+            html = book.read_text(doc)
+        except KeyError:
+            continue
+        css = book.css_for(doc, html)
+        parser = _BlockText()
+        parser.feed(html)
+        parser.close()
+        for chain in parser.chains:
+            if not chain:
+                continue
+            classes = chain[-1][1]
+            size = css.run_size(classes)
+            sizes[1.0 if size is None else size] = sizes.get(1.0 if size is None else size, 0) + 1
+            total += 1
+            if css.run_indented(classes):
+                indented += 1
+    if not total:
+        return _BodyStyle()
+    return _BodyStyle(max(sizes, key=lambda k: sizes[k]), indented * 2 > total)
+
 
 _HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 SUBHEAD_PLAIN = 1  # a blank line above and below it
 SUBHEAD_BOXED = 2  # the book drew a box: a line of `=` above and below instead
+CAPTION = 3  # a picture's caption: written as 圖:[...] with one blank line either side
+
+# What a picture caption is called, in the book's own language — same idea as [_note_word].
+_CAPTION_WORDS = {"zh-hant": "圖", "zh-hans": "图", "ja": "図", "ko": "그림"}
+
+
+def _caption_word(language: str) -> str:
+    code = (language or "").lower().replace("_", "-")
+    if code.startswith("ja"):
+        return "図"
+    if code.startswith("ko"):
+        return "그림"
+    if code.startswith("zh"):
+        return "图" if any(tag in code for tag in ("hans", "-cn", "-sg", "-my")) else "圖"
+    return "Fig"
 
 
 def _sub_headings(
@@ -820,6 +1163,9 @@ def _sub_headings(
     chain_of: list[list[tuple[str, list[str]]]],
     runs_of: list[list[tuple[str, str, list[str]]]],
     css: _Css,
+    body: "_BodyStyle | None" = None,
+    after_image: list[bool] | None = None,
+    in_notes: list[bool] | None = None,
 ) -> list[int]:
     """Which lines are a sub-heading inside a chapter, and did the book box it in?
 
@@ -853,22 +1199,67 @@ def _sub_headings(
     ("is the first line of this section the same as its label?") would be comparing the
     label against a row of `=`, and every chapter would print its title twice.
     """
+    body = body or _BodyStyle()
+    images = after_image or [False] * len(lines)
+    noted = in_notes or [False] * len(lines)
     out: list[int] = []
     for i, (line, chain, runs) in enumerate(zip(lines, chain_of, runs_of)):
+        if noted[i]:
+            # ⚠️ Inside the notes area nothing is a sub-heading. Books wrap each note in a
+            # heading tag (`<li><h3><a role="doc-backlink">[1]　見《…》</a></h3></li>`), and
+            # taking that at face value put every note at column 0 — which in this format means
+            # "sub-heading", so a whole page of notes came out in bold.
+            out.append(0)
+            continue
         tag, classes = chain[-1] if chain else ("", [])
         whole = [(t, c) for text, t, c in runs if text == line]
         boxed = any(
             css.framed(run_tag, run_classes) or css.run_framed(run_classes)
             for run_tag, run_classes in whole
         )
+        # every class that styles this line: the block's own, plus the runs that cover it
+        styling = list(classes)
+        for _text, _tag, run_classes in runs:
+            styling += run_classes
+        size = css.run_size(styling)
+        if size is None:
+            size = body.size
+        covered = bool(runs) and _norm("".join(text for text, _t, _c in runs)) == _norm(line)
         if tag in _HEADING_TAGS:
             out.append(SUBHEAD_BOXED if boxed or css.framed(tag, classes) else SUBHEAD_PLAIN)
         elif boxed:
             out.append(SUBHEAD_BOXED)
-        elif i == 0 and runs and _norm("".join(text for text, _t, _c in runs)) == _norm(line) and any(
+        elif (
+            images[i]
+            and size < body.size
+            and css.run_has(styling, "text-align", "center")
+        ):
+            # The text right after a picture, set SMALLER than the body and centred: that is
+            # a caption, and the picture it belongs to cannot come along (owner 2026-07-30).
+            out.append(CAPTION)
+        elif i == 0 and covered and any(
             css.heavier(run_classes) for _text, _tag, run_classes in runs
         ):
             out.append(SUBHEAD_PLAIN)
+        elif (
+            body.indented
+            and covered
+            and size > body.size
+            and not css.run_indented(styling)
+        ):
+            # ⚠️ The fourth signal, and the gate matters as much as the test: **bigger than
+            # this book's body AND not carrying the indent this book's body carries**. Books
+            # that mark their sub-headings this way indent every ordinary paragraph in CSS
+            # (`text-indent: 2em`) and leave the heading un-indented — the same statement the
+            # RTB-1 format makes in its own text. It is switched off entirely in a book that
+            # does not indent (`body.indented`), because there "no indent" says nothing.
+            #
+            # Underlined as well → the book drew a line under it, so it gets the box. Measured
+            # across the library: 258 plain and 98 underlined, in 4 books, the longest 29
+            # characters and every one of them a heading.
+            out.append(SUBHEAD_BOXED if css.run_has(styling, "text-decoration", "underline")
+                       or css.run_has(styling, "text-decoration-line", "underline")
+                       else SUBHEAD_PLAIN)
         else:
             out.append(0)
     return out
@@ -988,6 +1379,18 @@ class _BlockText(HTMLParser):
         # back-link, not on the note element).
         self._note: tuple[str, str] | None = None
         self._note_pending = False  # the note's first line has not been labelled yet
+        # after_image[i] = an <img>/<image> was seen since the previous line. A book's picture
+        # caption is the text right after the picture, and the picture cannot come along.
+        self.after_image: list[bool] = []
+        self._saw_image = False
+        # Open notes-AREA containers, as len(_open) at which each opened. Inside one, every
+        # block starts a new note (books mark the area and not the notes), and a heading tag is
+        # list furniture rather than a chapter sub-heading.
+        self._area_depth: list[int] = []
+        self.in_notes: list[bool] = []
+        # (first chunk, last chunk) of each link inside a note that points back into the text.
+        # Dropped at flush, but ONLY when the note has text outside them — see [_close_link].
+        self._back: list[tuple[int, int]] = []
         # Which lines open a note. A book introduces its notes with a rule (`<hr>`) and
         # sometimes leaves no air above it — see the note branch in [_extract].
         self.note_lines: set[int] = set()
@@ -1021,6 +1424,9 @@ class _BlockText(HTMLParser):
         # flushed means nothing.
         self._runs: list[tuple[int, str, list[str]]] = []
         self._done: list[tuple[str, str, list[str]]] = []  # (text, tag, classes), this line
+        # Did THIS line get a note marker from us? Only those get their spacing normalised —
+        # a book printing 「(註[2])」 as its own text keeps whatever spacing the author chose.
+        self._wrote_mark = False
         self._buf: list[str] = []
         self._skip = 0
         # one entry per open <a>: (how much of _buf was already there, its address or "",
@@ -1051,10 +1457,32 @@ class _BlockText(HTMLParser):
             self._block_seq += 1
             self._open.append((len(self.lines), 0, tag, (values.get("class") or "").split(), self._block_seq))
             self._open_note(values)
+            if self.notes is not None and _is_note_area(values):
+                self._area_depth.append(len(self._open))
+        if tag in ("img", "image"):
+            self._saw_image = True
         if tag == "hr":
             self._buf.append(HORIZONTAL_RULE)
             self._flush()
-        if self._note is None and self._note_depth and values.get("id"):
+        if (
+            self.notes is not None
+            and not self._note_depth
+            and values.get("id")
+            and self.notes.label_for(values["id"])
+        ):
+            # An id that the text points at as a note IS one note, even when nothing marks the
+            # element carrying it. Books put that id in three places and all three land here:
+            # on the note's block (a notes list's `<li>`), on the link back into the text
+            # inside it, or on a `<span>` around the number the note prints.
+            #
+            # ⚠️ It has to be the ID that starts the note, not merely 「a block inside the notes
+            # area」. A wrapping `<ol>` has no id, and letting it open the note made ONE note
+            # out of the whole list — the first `<li>` took the label and every other note came
+            # out unlabelled.
+            self._note_depth = [len(self._open)]
+            self._note, self._note_pending = None, True
+            self._name_note(values["id"])
+        elif self._note is None and self._note_depth and values.get("id"):
             self._name_note(values["id"])  # some books put the id on the back-link
         if tag == "a":
             href = (values.get("href") or "").strip()
@@ -1069,8 +1497,14 @@ class _BlockText(HTMLParser):
                     role = "back"
                 else:
                     shown = self.notes.reference(href, "noteref" in marks or "footnote" in marks)
+                    star = 0 if shown else self.notes.star(href)
                     if shown:
                         role = _note_label(self.notes.word, shown)
+                    elif star:
+                        # Words that point at an explanation. The words are the reader's
+                        # text, so the marker is ADDED after them rather than replacing
+                        # them — see [_note_index].
+                        role = f"after:{self.notes.star_label(star)}"
             self._links.append((len(self._buf), _clean_url(href) if EXTERNAL_LINK.match(href) else "", role))
         if tag not in self.BLOCK and tag not in self.VOID and values.get("class"):
             self._runs.append((len(self._buf), tag, values["class"].split()))
@@ -1126,9 +1560,7 @@ class _BlockText(HTMLParser):
         """Note whether this block element is a footnote, and what to label it with."""
         if self.notes is None:
             return
-        marks = " ".join((values.get("epub:type", ""), values.get("role", ""),
-                          values.get("rel", ""))).lower()
-        if not (any(t in marks for t in _NOTE_TYPES) or any(r in marks for r in _NOTE_ROLES)):
+        if not _is_note_element(values):
             return
         self._note_depth.append(len(self._open))
         self._note_pending = True
@@ -1145,6 +1577,8 @@ class _BlockText(HTMLParser):
             self._note_depth.pop()
             if not self._note_depth:
                 self._note, self._note_pending = None, False
+        while self._area_depth and self._area_depth[-1] > len(self._open):
+            self._area_depth.pop()
 
     def _close_link(self, start: int, href: str, role: str = "") -> None:
         """Write an outbound link's address into the text (owner 2026-07-29).
@@ -1171,10 +1605,20 @@ class _BlockText(HTMLParser):
         the reader's furniture, not the note.
         """
         start = min(start, len(self._buf))
+        if role.startswith("after:"):
+            self._wrote_mark = True
+            self._buf.append(f"({role[len("after:"):]})")
+            return
         if role == "back":
-            self._buf[start:] = []
+            # ⚠️ NOT deleted here. Some books put the whole note INSIDE the link that points
+            # back to the text — `<p epub:type="footnote"><a href="#ref">1　編註：…</a></p>` —
+            # and deleting the link then deleted the note. The decision needs the rest of the
+            # block, so it is deferred to [_flush]: a back-link is furniture only when the note
+            # has other text outside it. 8 notes were lost to this before it was caught.
+            self._back.append((start, len(self._buf)))
             return
         if role:
+            self._wrote_mark = True
             self._buf[start:] = [f"({role})"]
             return
         if not href:
@@ -1186,6 +1630,15 @@ class _BlockText(HTMLParser):
             self._buf.append(f" <{href}>")
 
     def _flush(self) -> None:
+        # A link back into the text is the reader's way home and has nothing to point at in a
+        # .txt — but only when the note says something else too. When the note's whole content
+        # is inside that link, the link IS the note (see [_close_link]).
+        if self._back:
+            keep = [chunk for i, chunk in enumerate(self._buf)
+                    if not any(a <= i < b for a, b in self._back)]
+            if _collapse("".join(keep)):
+                self._buf = keep
+            self._back = []
         text = _collapse("".join(self._buf))
         runs, self._buf, self._done, self._runs = self._done, [], [], []
         if not text:
@@ -1212,11 +1665,20 @@ class _BlockText(HTMLParser):
             text = f"{label}: {text}" if text else label
             self._note_pending = False
             self.note_lines.add(len(self.lines))
+        # One space each side of every marker this line carries (owner 2026-07-31): the two
+        # ways of writing one land differently otherwise — 「綠茶(註[4])必學」 against
+        # 「香菸 (註[★1])味」 — and a marker jammed against the words reads as part of them.
+        if self._wrote_mark:
+            text = _space_note_marks(text)
+            self._wrote_mark = False
         self.lines.append(text)
         self.blanks.append(self._pending_blanks)
         self.chains.append([(tag, classes) for _at, _kids, tag, classes, _uid in self._open])
         self.owners.append(self._open[-1][4] if self._open else 0)
         self.runs.append(runs)
+        self.in_notes.append(bool(self._area_depth or self._note_depth))
+        self.after_image.append(self._saw_image)
+        self._saw_image = False
         self._pending_blanks = 0
         for anchor in self._pending:
             self.anchors.setdefault(anchor, len(self.lines) - 1)
@@ -1227,8 +1689,57 @@ class _BlockText(HTMLParser):
         self._flush()
 
 
+def _star_targets(
+    lines: list[str], anchors: dict[str, int], blanks: list[int], heads: list[int],
+    notes: "_Notes | None",
+) -> tuple[list[str], dict[str, int], list[int], list[int]]:
+    """Write the `註[★N]: …` line that the ★ references in the text point at.
+
+    A ★ note has no number of its own anywhere — the book pointed words at an explanation
+    (see [_note_index]) — so both ends of the pair are written here rather than read.
+
+    The explanation is usually a sub-heading followed by its paragraphs. That heading keeps
+    being a heading, and the note's line goes in FRONT of it, repeating its words (owner
+    2026-07-30). Prefixing the heading itself would have cost the book a heading; a target
+    that is NOT a heading (a one-line explanation) is prefixed in place, so its words are
+    not said twice.
+    """
+    if notes is None:
+        return lines, anchors, blanks, heads
+    at: dict[int, int] = {}
+    for element_id, index in anchors.items():
+        number = notes.star_for_id(element_id)
+        # A rule is not a line of text and cannot be quoted into a note's line.
+        if number and index < len(lines) and lines[index] != HORIZONTAL_RULE:
+            at.setdefault(index, number)
+    if not at:
+        return lines, anchors, blanks, heads
+    out_lines: list[str] = []
+    out_blanks: list[int] = []
+    out_heads: list[int] = []
+    moved: dict[int, int] = {}
+    for i, line in enumerate(lines):
+        number = at.get(i)
+        if number and heads[i]:
+            moved[i] = len(out_lines)  # the id points at the NOTE, which is what it is
+            out_lines.append(f"{notes.star_label(number)}: {line}")
+            out_blanks.append(blanks[i])
+            out_heads.append(0)
+            out_lines.append(line)
+            out_blanks.append(0)
+            out_heads.append(heads[i])
+            continue
+        moved[i] = len(out_lines)
+        out_lines.append(f"{notes.star_label(number)}: {line}" if number else line)
+        out_blanks.append(blanks[i])
+        out_heads.append(heads[i])
+    return (out_lines, {name: moved.get(at_, at_) for name, at_ in anchors.items()},
+            out_blanks, out_heads)
+
+
 def _extract(
-    html: str, css: "_Css | None" = None, notes: "_Notes | None" = None
+    html: str, css: "_Css | None" = None, notes: "_Notes | None" = None,
+    body: "_BodyStyle | None" = None, caption_word: str = "圖",
 ) -> tuple[list[str], dict[str, int], list[int], list[int]]:
     """(paragraphs, id anchor -> paragraph index, blank lines before each, sub-heading kinds).
 
@@ -1242,7 +1753,13 @@ def _extract(
     parser.close()
     blanks = parser.blanks
     # A heading element is a heading with or without a stylesheet; only the box needs CSS.
-    heads = _sub_headings(parser.lines, parser.chains, parser.runs, css or _Css())
+    heads = _sub_headings(parser.lines, parser.chains, parser.runs, css or _Css(),
+                          body, parser.after_image, parser.in_notes)
+    # A caption is written 圖:[…] so a reader — and a person in Notepad — can tell it from the
+    # prose around it; the picture it described is not in a text file (owner 2026-07-30).
+    for i, kind in enumerate(heads):
+        if kind == CAPTION:
+            parser.lines[i] = f"{caption_word}:[{parser.lines[i]}]"
     # A book introduces its notes with a rule of its own (`<hr>`), and some leave no air
     # above it — the last line of the chapter then sits right on top of the line
     # (owner 2026-07-30). One blank line is ENSURED rather than added: three of the four
@@ -1252,10 +1769,11 @@ def _extract(
         if i > 0 and parser.lines[i - 1] == HORIZONTAL_RULE:
             blanks[i - 1] = max(blanks[i - 1], 1)
     if css is None:
-        return parser.lines, parser.anchors, blanks, heads
+        return _star_targets(parser.lines, parser.anchors, blanks, heads, notes)
     extra = _extra_blanks(parser.chains, parser.owners, css)
     blanks = [max(had, more) for had, more in zip(blanks, extra)]
-    return _border_rules(parser.lines, parser.anchors, blanks, parser.boxes, css, heads)
+    return _star_targets(
+        *_border_rules(parser.lines, parser.anchors, blanks, parser.boxes, css, heads), notes)
 
 
 class _NavParser(HTMLParser):
@@ -1778,14 +2296,19 @@ def convert(path: Path, with_cover: bool = True) -> tuple[str, str]:
         book.item_path(i) for i in book.spine
         if i in book.items and "html" in (book.items[i][1] or "html")
     ]
-    note_ids, note_labels = _note_index(book, content_docs)
+    note_ids, note_labels, note_stars = _note_index(book, content_docs)
     note_word = _note_word(book.language)
+    # The book's ordinary paragraph, measured book-wide (see [_body_style]).
+    body_style = _body_style(book, content_docs)
+    caption_word = _caption_word(book.language)
     body: list[str] = []
     emitted: list[tuple[int, str]] = []  # (depth, label) of the sections actually written
     guessed_date = ""
     seen: set[str] = set()
     # TOC entries waiting for a page to land on — see the "no text at all" branch below.
     carried: list[tuple[int, str, str]] = []
+    # Did the last thing written end on a heading or a caption? See [_paragraph_blocks].
+    trailing_head = False
 
     for item_id in book.spine:
         if item_id not in book.items:
@@ -1800,7 +2323,9 @@ def convert(path: Path, with_cover: bool = True) -> tuple[str, str]:
         try:
             html = book.read_text(doc)
             lines, anchors, blanks, heads = _extract(
-                html, book.css_for(doc, html), _Notes(doc, note_ids, note_labels, note_word)
+                html, book.css_for(doc, html),
+                _Notes(doc, note_ids, note_labels, note_word, note_stars),
+                body_style, caption_word,
             )
         except KeyError:
             continue
@@ -1826,13 +2351,15 @@ def convert(path: Path, with_cover: bool = True) -> tuple[str, str]:
                 # Not in the book's TOC (some publishers list only the parts, and a blurb
                 # or colophon is never listed). Keep every word, but do NOT invent a TOC
                 # entry: the .txt must show the same table of contents as the EPUB.
-                body.extend(_paragraph_blocks(lines, blanks, indent, heads))
+                body.extend(_paragraph_blocks(lines, blanks, indent, heads, trailing_head))
+                trailing_head = bool(heads[-1]) if heads else trailing_head
                 continue
         # A page that is skipped above (a title page, the book's own contents list) is not
         # a landing site: whatever is waiting stays waiting for a page that is kept.
         entries = carried + entries
         carried = []
         body.extend(_sections_for(entries, lines, anchors, emitted, indent, blanks, heads))
+        trailing_head = False  # a section starts with a fence; the fence owns its own spacing
 
     if carried:
         # Nothing with text left to land on — the book ends in plates. Write the labels as
@@ -1928,7 +2455,8 @@ def _sections_for(
         # A `while`, not an `elif`: a book often sets its title over SEVERAL lines and the
         # marker joins them, so 「Aesop's Fables」 / 「A Selection」 under the marker
         # 「Aesop's Fables: A Selection」 is one repeat spelt in two headings.
-        while chunk and chunk_heads[0] and _norm(chunk[0]) and _norm(chunk[0]) in _norm(label):
+        while (chunk and chunk_heads[0] in (SUBHEAD_PLAIN, SUBHEAD_BOXED)
+               and _norm(chunk[0]) and _norm(chunk[0]) in _norm(label)):
             chunk, chunk_blanks, chunk_heads = chunk[1:], chunk_blanks[1:], chunk_heads[1:]
         if TOC_LABEL.match(label):
             continue  # the book's own contents page — the header's Contents replaces it
@@ -1995,6 +2523,7 @@ def _paragraph_blocks(
     blanks: list[int],
     indent: str,
     heads: list[int] | None = None,
+    after_heading: bool = False,
 ) -> list[str]:
     """Body paragraphs with the source's own empty paragraphs restored between them.
 
@@ -2027,7 +2556,10 @@ def _paragraph_blocks(
     """
     kinds = heads if heads is not None else [0] * len(paragraphs)
     out: list[str] = []
-    after_heading = False
+    # `after_heading` starts True when the PREVIOUS call ended on a heading or a caption: it
+    # already wrote the blank line that goes after it, and this call must not write it again.
+    # A run of plates, each its own XHTML file with nothing but a caption, is exactly that —
+    # every caption is a separate call, and both halves of the blank were being written.
     for position, paragraph in enumerate(paragraphs):
         kind = kinds[position] if position < len(kinds) else 0
         if after_heading:
@@ -2040,7 +2572,10 @@ def _paragraph_blocks(
         if kind == SUBHEAD_BOXED:
             out.extend([HEADING_RULE, _body_line(paragraph, ""), HEADING_RULE])
         else:
-            out.append(_body_line(paragraph, "" if kind else indent))
+            # ⚠️ A caption KEEPS the indent. It is prose about a picture, not a heading, and
+            # in this format an un-indented line means "sub-heading" — writing it flush would
+            # make every caption come out as a bold heading in the reader.
+            out.append(_body_line(paragraph, indent if kind in (0, CAPTION) else ""))
         if kind:
             # ⚠️ The blank line AFTER a heading is written here, with the heading, and NOT
             # left to the next paragraph to write. A chapter is often split across XHTML
